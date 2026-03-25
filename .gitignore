@@ -1,0 +1,49 @@
+# ESP-IDF build output
+build/
+*.bin
+*.elf
+*.map
+
+# ESP-IDF sdkconfig files
+sdkconfig.old
+sdkconfig.*.old
+
+# Component manager
+dependencies.lock
+managed_components/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+env/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Flash download tool
+flash_project_args
+
+# GDB files
+.gdb_history
+
+# Core dumps
+*.core
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.old

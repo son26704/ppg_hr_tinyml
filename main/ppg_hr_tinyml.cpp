@@ -108,14 +108,14 @@ namespace
 
     constexpr float SCHED_STD_MIN = 250.0f;
     constexpr float SCHED_PTP_MIN = 1000.0f;
-    constexpr float SCHED_PTP_MAX = 120000.0f;
-    constexpr float SCHED_AC_MIN = 0.40f;
-    constexpr float SCHED_AC_HARD = 0.30f;
-    constexpr float SCHED_AC_EASY = 0.45f;
-    constexpr float SCHED_DIFF_HARD = 0.70f;
-    constexpr float SCHED_DIFF_EASY = 0.55f;
-    constexpr int SCHED_BAD_WINDOWS_TO_UP = 3;
-    constexpr int SCHED_GOOD_WINDOWS_TO_DOWN = 4;
+    constexpr float SCHED_PTP_MAX = 35000.0f;
+    constexpr float SCHED_AC_MIN = 0.30f;
+    constexpr float SCHED_AC_HARD = 0.20f;
+    constexpr float SCHED_AC_EASY = 0.40f;
+    constexpr float SCHED_DIFF_HARD = 0.80f;
+    constexpr float SCHED_DIFF_EASY = 0.60f;
+    constexpr int SCHED_BAD_WINDOWS_TO_UP = 4;
+    constexpr int SCHED_GOOD_WINDOWS_TO_DOWN = 5;
     constexpr int SCHED_COOLDOWN_WINDOWS = 3;
     constexpr int64_t SCHED_MIN_STATE_DWELL_US = 15LL * 1000LL * 1000LL;
     constexpr float NO_CONTACT_STD_HP_MIN = 6000.0f;
@@ -1148,12 +1148,29 @@ namespace
                     int8_t y_q = 0;
                     if (run_tinyml_on_features(&ai_bpm, &y_q))
                     {
-                        ESP_LOGI(TAG,
-                                 "AI_ASSIST(not_hr)=%.2f | y_q=%d | dsp_peak=%.1f ac=%.3f",
-                                 ai_bpm,
-                                 static_cast<int>(y_q),
-                                 peak_bpm,
-                                 ac_best);
+                        float ai_bpm = 0.0f;
+                        int8_t y_q = 0;
+                        if (run_tinyml_on_features(&ai_bpm, &y_q))
+                        {
+                            if (!g_has_bpm_ema)
+                            {
+                                g_bpm_ema = ai_bpm;
+                                g_has_bpm_ema = true;
+                            }
+                            else
+                            {
+                                constexpr float kAiEmaAlpha = 0.15f; // Trọng số AI rất thấp để chống nhảy số
+                                g_bpm_ema = (kAiEmaAlpha * ai_bpm) + ((1.0f - kAiEmaAlpha) * g_bpm_ema);
+                            }
+
+                            ESP_LOGI(TAG,
+                                     "AI_ASSIST_HR=%.2f | raw_ai=%.2f | y_q=%d | dsp_peak=%.1f ac=%.3f",
+                                     g_bpm_ema,
+                                     ai_bpm,
+                                     static_cast<int>(y_q),
+                                     peak_bpm,
+                                     ac_best);
+                        }
                     }
                 }
 

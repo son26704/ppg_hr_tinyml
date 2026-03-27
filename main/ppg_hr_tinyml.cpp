@@ -59,14 +59,95 @@ namespace
     constexpr uint8_t REG_LED2_PA = 0x0D;
     constexpr uint8_t REG_PART_ID = 0xFF;
 
+    struct max30102_profile_t
+    {
+        uint8_t fifo_config;
+        uint8_t spo2_config;
+        uint8_t led1_pa;
+        uint8_t led2_pa;
+        uint8_t mode_config;
+        int sample_rate_hz;
+        const char *name;
+    };
+
+    static const max30102_profile_t kProfile50Med = {
+        0x00,
+        0x23,
+        0x18,
+        0x18,
+        0x03,
+        50,
+        "50sps_med",
+    };
+
+    static const max30102_profile_t kProfile100Med = {
+        0x00,
+        0x27,
+        0x18,
+        0x18,
+        0x03,
+        100,
+        "100sps_med",
+    };
+
+    enum scheduler_state_t
+    {
+        SCHED_STATE_NORMAL = 0,
+        SCHED_STATE_HIGH = 1,
+    };
+
+    enum quality_fail_reason_t
+    {
+        QFR_NONE = 0,
+        QFR_NO_CONTACT,
+        QFR_AMP_FAIL,
+        QFR_AC_FAIL,
+        QFR_HR_RANGE_FAIL,
+        QFR_CONSIST_FAIL,
+    };
+
+    constexpr float SCHED_STD_MIN = 250.0f;
+    constexpr float SCHED_PTP_MIN = 1000.0f;
+    constexpr float SCHED_PTP_MAX = 120000.0f;
+    constexpr float SCHED_AC_MIN = 0.40f;
+    constexpr float SCHED_AC_HARD = 0.30f;
+    constexpr float SCHED_AC_EASY = 0.45f;
+    constexpr float SCHED_DIFF_HARD = 0.70f;
+    constexpr float SCHED_DIFF_EASY = 0.55f;
+    constexpr int SCHED_BAD_WINDOWS_TO_UP = 3;
+    constexpr int SCHED_GOOD_WINDOWS_TO_DOWN = 4;
+    constexpr int SCHED_COOLDOWN_WINDOWS = 3;
+    constexpr int64_t SCHED_MIN_STATE_DWELL_US = 15LL * 1000LL * 1000LL;
+    constexpr float NO_CONTACT_STD_HP_MIN = 6000.0f;
+    constexpr float NO_CONTACT_STD_HP_SOFT = 2500.0f;
+    constexpr float NO_CONTACT_PTP_HP_MIN = 30000.0f;
+    constexpr float NO_CONTACT_PEAK_BPM_MAX = 40.0f;
+    constexpr float NO_CONTACT_AC_MAX = 0.20f;
+    constexpr float HR_CONSIST_MAX_DIFF_BPM = 18.0f;
+    constexpr int DSP_PUBLISH_WINDOWS = 2;
+    constexpr int DECISION_FREEZE_ON_ERROR_WINDOWS = 2;
+    constexpr int DECISION_FREEZE_ON_RECOVER_WINDOWS = 4;
+    constexpr int GRAY_WINDOWS_TO_UP = 4;
+    constexpr float AC_HR_CLAMP_LOW = 42.0f;
+    constexpr float AC_HR_CLAMP_HIGH = 178.0f;
+
     static float g_ir_ring[kWindowSamplesSensor] = {0};
     static int g_ir_head = 0;
     static int g_ir_count = 0;
-    static int g_since_last_infer = 0;
+    static int g_since_last_eval = 0;
+    static int g_window_samples = 400;
+    static int g_stride_samples = 100;
+    static int g_current_fs = 50;
     static float g_bpm_ema = 0.0f;
     static bool g_has_bpm_ema = false;
     static TaskHandle_t inference_task_handle = nullptr;
     static portMUX_TYPE g_ring_mux = portMUX_INITIALIZER_UNLOCKED;
+    static portMUX_TYPE g_state_mux = portMUX_INITIALIZER_UNLOCKED;
+    static scheduler_state_t g_sched_state = SCHED_STATE_NORMAL;
+    static scheduler_state_t g_desired_state = SCHED_STATE_NORMAL;
+    static bool g_switch_pending = false;
+    static int64_t g_last_state_switch_us = 0;
+    static int g_decision_freeze_windows = 0;
 
     static float g_win_sensor[kWindowSamplesSensor] = {0};
     static float g_win_model[kWindowSamplesModel] = {0};
@@ -80,19 +161,44 @@ namespace
     static float g_scratch_proms[128] = {0};
     static float g_scratch_hr_inst[127] = {0};
     static float g_scratch_pxx[129] = {0};
+    static float g_scratch_hp[kWindowSamplesSensor] = {0};
 
     static const float kScalerMean[kFeatureCount] = {
-        -0.0737763546f, 1.16286546f, 6.71091704f, 1.17152003f,
-        0.874481609f, 0.142864371f, 12.2170699f, 1.52713374f,
-        98.2353491f, 23.575453f, 2.6134389f, 0.479753285f,
-        67.7734996f, 0.907376801f, 0.411012795f, 79.7886578f,
+        -0.0737763546f,
+        1.16286546f,
+        6.71091704f,
+        1.17152003f,
+        0.874481609f,
+        0.142864371f,
+        12.2170699f,
+        1.52713374f,
+        98.2353491f,
+        23.575453f,
+        2.6134389f,
+        0.479753285f,
+        67.7734996f,
+        0.907376801f,
+        0.411012795f,
+        79.7886578f,
     };
 
     static const float kScalerScale[kFeatureCount] = {
-        0.116390851f, 0.450887383f, 4.66606231f, 0.449539888f,
-        0.192789786f, 0.0380347511f, 2.29328924f, 0.286661155f,
-        18.9886333f, 11.6544007f, 0.630249684f, 0.210682037f,
-        16.7382242f, 0.0549132159f, 0.0611779285f, 22.5167811f,
+        0.116390851f,
+        0.450887383f,
+        4.66606231f,
+        0.449539888f,
+        0.192789786f,
+        0.0380347511f,
+        2.29328924f,
+        0.286661155f,
+        18.9886333f,
+        11.6544007f,
+        0.630249684f,
+        0.210682037f,
+        16.7382242f,
+        0.0549132159f,
+        0.0611779285f,
+        22.5167811f,
     };
 
     inline float clampf(float v, float lo, float hi)
@@ -375,8 +481,9 @@ namespace
         }
         float std = std_of(g_scratch_x, n, mean);
 
-        const int min_distance = (static_cast<int>(fs * 0.33f) > 1) ? static_cast<int>(fs * 0.33f) : 1;
-        const float prominence = ((0.15f * std) > 0.05f) ? (0.15f * std) : 0.05f;
+        // Use stricter peak constraints to reduce double-peak overcount on fingertip signals.
+        const int min_distance = (static_cast<int>(fs * 60.0f / 140.0f) > 1) ? static_cast<int>(fs * 60.0f / 140.0f) : 1;
+        const float prominence = ((0.25f * std) > 0.12f) ? (0.25f * std) : 0.12f;
 
         const int n_peaks = find_peaks_simple(g_scratch_x, n, min_distance, prominence, g_scratch_peaks, g_scratch_proms, 128);
 
@@ -478,6 +585,41 @@ namespace
         return i2c_master_write_read_device(I2C_PORT, MAX30102_ADDR, &reg, 1, buf, len, pdMS_TO_TICKS(1000));
     }
 
+    esp_err_t max30102_apply_profile(const max30102_profile_t *profile)
+    {
+        if (profile == nullptr)
+            return ESP_ERR_INVALID_ARG;
+
+        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_MODE_CONFIG, 0x40), TAG, "reset fail");
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_FIFO_WR_PTR, 0x00), TAG, "fifo wr fail");
+        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_OVF_COUNTER, 0x00), TAG, "fifo ovf fail");
+        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_FIFO_RD_PTR, 0x00), TAG, "fifo rd fail");
+
+        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_FIFO_CONFIG, profile->fifo_config), TAG, "fifo cfg fail");
+        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_SPO2_CONFIG, profile->spo2_config), TAG, "spo2 cfg fail");
+        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_LED1_PA, profile->led1_pa), TAG, "led1 fail");
+        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_LED2_PA, profile->led2_pa), TAG, "led2 fail");
+        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_MODE_CONFIG, profile->mode_config), TAG, "mode cfg fail");
+
+        ESP_LOGI(TAG, "MAX30102 profile applied: %s (%dsps)", profile->name, profile->sample_rate_hz);
+        return ESP_OK;
+    }
+
+    void add_decision_freeze_windows(int n)
+    {
+        if (n <= 0)
+            return;
+
+        taskENTER_CRITICAL(&g_state_mux);
+        if (g_decision_freeze_windows < n)
+        {
+            g_decision_freeze_windows = n;
+        }
+        taskEXIT_CRITICAL(&g_state_mux);
+    }
+
     esp_err_t max30102_fifo_pending(uint8_t *pending)
     {
         if (pending == nullptr)
@@ -536,35 +678,65 @@ namespace
         uint8_t part_id = 0;
         ESP_RETURN_ON_ERROR(max30102_read_reg(REG_PART_ID, &part_id), TAG, "read part id fail");
         ESP_LOGI(TAG, "MAX30102 PART_ID=0x%02X", part_id);
+        ESP_LOGI(TAG, "MAX30102 probe done");
+        return ESP_OK;
+    }
 
-        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_MODE_CONFIG, 0x40), TAG, "reset fail");
-        vTaskDelay(pdMS_TO_TICKS(100));
+    void update_sampling_params_locked(scheduler_state_t state)
+    {
+        if (state == SCHED_STATE_HIGH)
+        {
+            g_current_fs = 100;
+            g_window_samples = 100 * kWindowSec;
+            g_stride_samples = 100 * kStrideSec;
+        }
+        else
+        {
+            g_current_fs = 50;
+            g_window_samples = 50 * kWindowSec;
+            g_stride_samples = 50 * kStrideSec;
+        }
+    }
 
-        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_FIFO_WR_PTR, 0x00), TAG, "fifo wr fail");
-        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_OVF_COUNTER, 0x00), TAG, "fifo ovf fail");
-        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_FIFO_RD_PTR, 0x00), TAG, "fifo rd fail");
+    esp_err_t apply_scheduler_state(scheduler_state_t state)
+    {
+        const max30102_profile_t *profile = (state == SCHED_STATE_HIGH) ? &kProfile100Med : &kProfile50Med;
+        ESP_RETURN_ON_ERROR(max30102_apply_profile(profile), TAG, "apply profile fail");
 
-        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_FIFO_CONFIG, 0x00), TAG, "fifo cfg fail");
-        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_SPO2_CONFIG, 0x27), TAG, "spo2 cfg fail");
-        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_LED1_PA, 0x18), TAG, "led1 fail");
-        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_LED2_PA, 0x18), TAG, "led2 fail");
-        ESP_RETURN_ON_ERROR(max30102_write_reg(REG_MODE_CONFIG, 0x03), TAG, "mode cfg fail");
+        taskENTER_CRITICAL(&g_ring_mux);
+        g_ir_head = 0;
+        g_ir_count = 0;
+        g_since_last_eval = 0;
+        taskEXIT_CRITICAL(&g_ring_mux);
 
-        ESP_LOGI(TAG, "MAX30102 init done (100sps)");
+        taskENTER_CRITICAL(&g_state_mux);
+        g_sched_state = state;
+        update_sampling_params_locked(state);
+        g_last_state_switch_us = esp_timer_get_time();
+        taskEXIT_CRITICAL(&g_state_mux);
+
+        ESP_LOGI(TAG, "Scheduler state -> %s", (state == SCHED_STATE_HIGH) ? "HIGH(100sps)" : "NORMAL(50sps)");
         return ESP_OK;
     }
 
     esp_err_t max30102_recover()
     {
         ESP_LOGW(TAG, "Recovering MAX30102...");
+        scheduler_state_t state_snapshot;
+        taskENTER_CRITICAL(&g_state_mux);
+        state_snapshot = g_sched_state;
+        taskEXIT_CRITICAL(&g_state_mux);
+
         esp_err_t err = max30102_init();
         if (err == ESP_OK)
         {
-            g_ir_head = 0;
-            g_ir_count = 0;
-            g_since_last_infer = 0;
-            g_has_bpm_ema = false;
-            ESP_LOGW(TAG, "MAX30102 recover success");
+            err = apply_scheduler_state(state_snapshot);
+            if (err == ESP_OK)
+            {
+                g_has_bpm_ema = false;
+                add_decision_freeze_windows(DECISION_FREEZE_ON_RECOVER_WINDOWS);
+                ESP_LOGW(TAG, "MAX30102 recover success");
+            }
         }
         else
         {
@@ -630,11 +802,18 @@ namespace
         g_ir_head = (g_ir_head + 1) % kWindowSamplesSensor;
         if (g_ir_count < kWindowSamplesSensor)
             ++g_ir_count;
-        ++g_since_last_infer;
+        ++g_since_last_eval;
 
-        if (g_since_last_infer >= kStrideSamplesSensor && g_ir_count >= kWindowSamplesSensor)
+        int stride_samples_snapshot;
+        int window_samples_snapshot;
+        taskENTER_CRITICAL(&g_state_mux);
+        stride_samples_snapshot = g_stride_samples;
+        window_samples_snapshot = g_window_samples;
+        taskEXIT_CRITICAL(&g_state_mux);
+
+        if (g_since_last_eval >= stride_samples_snapshot && g_ir_count >= window_samples_snapshot)
         {
-            g_since_last_infer = 0;
+            g_since_last_eval = 0;
             should_notify = true;
         }
         taskEXIT_CRITICAL(&g_ring_mux);
@@ -645,16 +824,16 @@ namespace
         }
     }
 
-    bool snapshot_window(float *out)
+    bool snapshot_window(float *out, int n_samples)
     {
         taskENTER_CRITICAL(&g_ring_mux);
-        if (g_ir_count < kWindowSamplesSensor)
+        if (n_samples <= 0 || n_samples > kWindowSamplesSensor || g_ir_count < n_samples)
         {
             taskEXIT_CRITICAL(&g_ring_mux);
             return false;
         }
-        int idx = g_ir_head;
-        for (int i = 0; i < kWindowSamplesSensor; ++i)
+        int idx = (g_ir_head - n_samples + kWindowSamplesSensor) % kWindowSamplesSensor;
+        for (int i = 0; i < n_samples; ++i)
         {
             out[i] = g_ir_ring[idx];
             idx = (idx + 1) % kWindowSamplesSensor;
@@ -663,15 +842,84 @@ namespace
         return true;
     }
 
-    bool run_inference_once()
+    void compute_hp_metrics(const float *x, int n, float fs_hz, float *std_hp, float *ptp_hp)
     {
-        if (!snapshot_window(g_win_sensor))
+        if (x == nullptr || std_hp == nullptr || ptp_hp == nullptr || n <= 1)
+        {
+            if (std_hp != nullptr)
+                *std_hp = 0.0f;
+            if (ptp_hp != nullptr)
+                *ptp_hp = 0.0f;
+            return;
+        }
+
+        const float fs = (fs_hz > 1.0f) ? fs_hz : 50.0f;
+        const float dt = 1.0f / fs;
+        const float tau = 0.8f;
+        float alpha = dt / (tau + dt);
+        alpha = clampf(alpha, 0.001f, 1.0f);
+
+        float lp = x[0];
+        float hp_min = 0.0f;
+        float hp_max = 0.0f;
+        float sum = 0.0f;
+        float sum_sq = 0.0f;
+
+        for (int i = 0; i < n; ++i)
+        {
+            lp += alpha * (x[i] - lp);
+            const float hp = x[i] - lp;
+            g_scratch_hp[i] = hp;
+            if (i == 0)
+            {
+                hp_min = hp;
+                hp_max = hp;
+            }
+            else
+            {
+                if (hp < hp_min)
+                    hp_min = hp;
+                if (hp > hp_max)
+                    hp_max = hp;
+            }
+            sum += hp;
+            sum_sq += hp * hp;
+        }
+
+        const float n_f = static_cast<float>(n);
+        const float mean = sum / n_f;
+        float var = (sum_sq / n_f) - (mean * mean);
+        if (var < 0.0f)
+            var = 0.0f;
+        *std_hp = sqrtf(var);
+        *ptp_hp = hp_max - hp_min;
+    }
+
+    bool compute_window_features(float *peak_bpm, float *ac_best, float *std_hp, float *ptp_hp)
+    {
+        int window_samples_snapshot;
+        int fs_snapshot;
+        taskENTER_CRITICAL(&g_state_mux);
+        window_samples_snapshot = g_window_samples;
+        fs_snapshot = g_current_fs;
+        taskEXIT_CRITICAL(&g_state_mux);
+
+        if (!snapshot_window(g_win_sensor, window_samples_snapshot))
             return false;
 
-        resample_linear(g_win_sensor, kWindowSamplesSensor, g_win_model, kWindowSamplesModel);
+        compute_hp_metrics(g_win_sensor, window_samples_snapshot, static_cast<float>(fs_snapshot), std_hp, ptp_hp);
+
+        resample_linear(g_win_sensor, window_samples_snapshot, g_win_model, kWindowSamplesModel);
 
         extract_ppg_features(g_win_model, kWindowSamplesModel, kModelFs, g_feat);
 
+        *peak_bpm = g_feat[7] * 60.0f;
+        *ac_best = g_feat[11];
+        return true;
+    }
+
+    bool run_tinyml_on_features(float *y_bpm, int8_t *y_q)
+    {
         const float in_scale = g_input->params.scale;
         const int in_zp = g_input->params.zero_point;
         for (int i = 0; i < kFeatureCount; ++i)
@@ -693,59 +941,264 @@ namespace
             return false;
         }
 
-        const int8_t y_q = g_output->data.int8[0];
-        const float y_norm = dequantize_int8(y_q, g_output->params.scale, g_output->params.zero_point);
-        const float y_bpm_raw = y_norm * kHrStdBpm + kHrMeanBpm;
-
-        const float bpm_from_peaks = g_feat[7] * 60.0f;
-        const bool quality_ok = (g_feat[11] >= 0.20f) && (bpm_from_peaks >= 40.0f) && (bpm_from_peaks <= 180.0f);
-
-        if (!quality_ok)
-        {
-            ESP_LOGW(TAG,
-                     "Low quality window: ac=%.3f peak_bpm=%.1f std=%.3f",
-                     g_feat[11],
-                     bpm_from_peaks,
-                     g_feat[1]);
-            return false;
-        }
-
-        const float y_bpm = clampf(y_bpm_raw, 40.0f, 180.0f);
-        if (!g_has_bpm_ema)
-        {
-            g_bpm_ema = y_bpm;
-            g_has_bpm_ema = true;
-        }
-        else
-        {
-            constexpr float kEmaAlpha = 0.25f;
-            g_bpm_ema = (kEmaAlpha * y_bpm) + ((1.0f - kEmaAlpha) * g_bpm_ema);
-        }
-
-        ESP_LOGI(TAG,
-                 "BPM=%.2f (raw=%.2f) | y_q=%d | std=%.3f peak_rate=%.3f ac=%.3f",
-                 g_bpm_ema,
-                 y_bpm,
-                 static_cast<int>(y_q),
-                 g_feat[1],
-                 g_feat[7],
-                 g_feat[11]);
+        const int8_t y_q_local = g_output->data.int8[0];
+        const float y_norm = dequantize_int8(y_q_local, g_output->params.scale, g_output->params.zero_point);
+        *y_bpm = clampf(y_norm * kHrStdBpm + kHrMeanBpm, 40.0f, 180.0f);
+        *y_q = y_q_local;
         return true;
     }
 
     void inference_task(void *arg)
     {
+        int bad_windows = 0;
+        int gray_windows = 0;
+        int good_windows = 0;
+        int dsp_publish_windows = 0;
+        int cooldown_windows = 0;
+
         while (true)
         {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-            run_inference_once();
+
+            float peak_bpm = 0.0f;
+            float ac_best = 0.0f;
+            float std_hp = 0.0f;
+            float ptp_hp = 0.0f;
+
+            if (!compute_window_features(&peak_bpm, &ac_best, &std_hp, &ptp_hp))
+                continue;
+
+            const bool amplitude_ok = (std_hp >= SCHED_STD_MIN) && (ptp_hp >= SCHED_PTP_MIN) && (ptp_hp <= SCHED_PTP_MAX);
+            const bool periodic_ok = (ac_best >= SCHED_AC_MIN);
+            const bool hr_range_ok = (peak_bpm >= 40.0f) && (peak_bpm <= 180.0f);
+            const bool quality_ok = amplitude_ok && periodic_ok && hr_range_ok;
+            const float difficulty_proxy = amplitude_ok ? clampf(1.0f - ac_best, 0.0f, 1.0f) : 1.0f;
+            const float ac_best_hr = g_feat[12];
+            const bool ac_hr_valid = (ac_best_hr >= 40.0f) && (ac_best_hr <= 180.0f) &&
+                                     (ac_best_hr > AC_HR_CLAMP_LOW) && (ac_best_hr < AC_HR_CLAMP_HIGH);
+            const bool hr_consistent = ac_hr_valid && (fabsf(peak_bpm - ac_best_hr) <= HR_CONSIST_MAX_DIFF_BPM);
+            const bool no_contact_hard = (peak_bpm <= NO_CONTACT_PEAK_BPM_MAX) &&
+                                         ((std_hp >= NO_CONTACT_STD_HP_MIN) || (ptp_hp >= NO_CONTACT_PTP_HP_MIN));
+            const bool no_contact_soft = (peak_bpm <= NO_CONTACT_PEAK_BPM_MAX) &&
+                                         (ac_best <= NO_CONTACT_AC_MAX) &&
+                                         (std_hp >= NO_CONTACT_STD_HP_SOFT);
+            const bool no_contact = no_contact_hard || no_contact_soft;
+
+            const bool amp_fail = !amplitude_ok;
+            const bool ac_fail = !periodic_ok;
+            const bool range_fail = !hr_range_ok;
+            const bool consist_fail = !hr_consistent;
+
+            quality_fail_reason_t fail_reason = QFR_NONE;
+            if (no_contact)
+            {
+                fail_reason = QFR_NO_CONTACT;
+            }
+            else if (amp_fail)
+            {
+                fail_reason = QFR_AMP_FAIL;
+            }
+            else if (range_fail)
+            {
+                fail_reason = QFR_HR_RANGE_FAIL;
+            }
+            else if (ac_fail)
+            {
+                fail_reason = QFR_AC_FAIL;
+            }
+            else if (consist_fail)
+            {
+                fail_reason = QFR_CONSIST_FAIL;
+            }
+
+            const bool severe_motion_fail = (fail_reason == QFR_AMP_FAIL) || (fail_reason == QFR_HR_RANGE_FAIL);
+            const bool mild_fail = (fail_reason == QFR_AC_FAIL) || (fail_reason == QFR_CONSIST_FAIL);
+
+            scheduler_state_t state_snapshot;
+            int64_t last_switch_snapshot = 0;
+            int freeze_windows_snapshot = 0;
+            taskENTER_CRITICAL(&g_state_mux);
+            state_snapshot = g_sched_state;
+            last_switch_snapshot = g_last_state_switch_us;
+            freeze_windows_snapshot = g_decision_freeze_windows;
+            if (g_decision_freeze_windows > 0)
+            {
+                g_decision_freeze_windows--;
+            }
+            taskEXIT_CRITICAL(&g_state_mux);
+            const int64_t now_us = esp_timer_get_time();
+            const bool dwell_ok = (now_us - last_switch_snapshot) >= SCHED_MIN_STATE_DWELL_US;
+            const bool decision_frozen = freeze_windows_snapshot > 0;
+
+            if (quality_ok && hr_consistent && !no_contact)
+            {
+                dsp_publish_windows++;
+                const float bpm_dsp = clampf(peak_bpm, 40.0f, 180.0f);
+                if (dsp_publish_windows >= DSP_PUBLISH_WINDOWS)
+                {
+                    if (!g_has_bpm_ema)
+                    {
+                        g_bpm_ema = bpm_dsp;
+                        g_has_bpm_ema = true;
+                    }
+                    else
+                    {
+                        constexpr float kEmaAlpha = 0.35f;
+                        g_bpm_ema = (kEmaAlpha * bpm_dsp) + ((1.0f - kEmaAlpha) * g_bpm_ema);
+                    }
+
+                    ESP_LOGI(TAG,
+                             "DSP_HR=%.2f | state=%d | ac=%.3f ac_hr=%.1f std_hp=%.1f ptp_hp=%.1f",
+                             g_bpm_ema,
+                             static_cast<int>(state_snapshot),
+                             ac_best,
+                             ac_best_hr,
+                             std_hp,
+                             ptp_hp);
+                }
+                else
+                {
+                    ESP_LOGW(TAG,
+                             "DSP_HOLD: state=%d peak=%.1f ac_hr=%.1f ac=%.3f",
+                             static_cast<int>(state_snapshot),
+                             peak_bpm,
+                             ac_best_hr,
+                             ac_best);
+                }
+            }
+            else
+            {
+                dsp_publish_windows = 0;
+                if (no_contact)
+                {
+                    ESP_LOGW(TAG,
+                             "NO_CONTACT: state=%d ac=%.3f peak_bpm=%.1f std_hp=%.1f ptp_hp=%.1f",
+                             static_cast<int>(state_snapshot),
+                             ac_best,
+                             peak_bpm,
+                             std_hp,
+                             ptp_hp);
+                }
+                else
+                {
+                    ESP_LOGW(TAG,
+                             "Low quality window: state=%d reason=%d ac=%.3f peak_bpm=%.1f ac_hr=%.1f std_hp=%.1f ptp_hp=%.1f",
+                             static_cast<int>(state_snapshot),
+                             static_cast<int>(fail_reason),
+                             ac_best,
+                             peak_bpm,
+                             ac_best_hr,
+                             std_hp,
+                             ptp_hp);
+                }
+            }
+
+            if (state_snapshot == SCHED_STATE_NORMAL)
+            {
+                if (no_contact)
+                {
+                    bad_windows = 0;
+                    gray_windows = 0;
+                    good_windows = 0;
+                    dsp_publish_windows = 0;
+                    continue;
+                }
+
+                if (decision_frozen)
+                {
+                    ESP_LOGW(TAG, "Decision freeze active (windows=%d), hold NORMAL", freeze_windows_snapshot);
+                    bad_windows = 0;
+                    gray_windows = 0;
+                    continue;
+                }
+
+                if (severe_motion_fail || (ac_best <= SCHED_AC_HARD) || (difficulty_proxy >= SCHED_DIFF_HARD))
+                {
+                    bad_windows++;
+                    gray_windows = 0;
+                }
+                else if (mild_fail)
+                {
+                    gray_windows++;
+                    bad_windows = 0;
+                }
+                else
+                {
+                    bad_windows = 0;
+                    gray_windows = 0;
+                }
+
+                if ((bad_windows >= SCHED_BAD_WINDOWS_TO_UP || gray_windows >= GRAY_WINDOWS_TO_UP) && dwell_ok)
+                {
+                    taskENTER_CRITICAL(&g_state_mux);
+                    g_desired_state = SCHED_STATE_HIGH;
+                    g_switch_pending = true;
+                    taskEXIT_CRITICAL(&g_state_mux);
+                    bad_windows = 0;
+                    gray_windows = 0;
+                    good_windows = 0;
+                    cooldown_windows = SCHED_COOLDOWN_WINDOWS;
+                }
+            }
+            else
+            {
+                if (!no_contact)
+                {
+                    float ai_bpm = 0.0f;
+                    int8_t y_q = 0;
+                    if (run_tinyml_on_features(&ai_bpm, &y_q))
+                    {
+                        ESP_LOGI(TAG,
+                                 "AI_ASSIST(not_hr)=%.2f | y_q=%d | dsp_peak=%.1f ac=%.3f",
+                                 ai_bpm,
+                                 static_cast<int>(y_q),
+                                 peak_bpm,
+                                 ac_best);
+                    }
+                }
+
+                if (cooldown_windows > 0)
+                {
+                    cooldown_windows--;
+                }
+                else
+                {
+                    if (decision_frozen)
+                    {
+                        ESP_LOGW(TAG, "Decision freeze active (windows=%d), hold HIGH", freeze_windows_snapshot);
+                        continue;
+                    }
+
+                    if (no_contact)
+                    {
+                        good_windows = SCHED_GOOD_WINDOWS_TO_DOWN;
+                    }
+                    else if (quality_ok && hr_consistent && ac_best >= SCHED_AC_EASY && difficulty_proxy <= SCHED_DIFF_EASY)
+                    {
+                        good_windows++;
+                    }
+                    else
+                    {
+                        good_windows = 0;
+                    }
+
+                    if (good_windows >= SCHED_GOOD_WINDOWS_TO_DOWN && dwell_ok)
+                    {
+                        taskENTER_CRITICAL(&g_state_mux);
+                        g_desired_state = SCHED_STATE_NORMAL;
+                        g_switch_pending = true;
+                        taskEXIT_CRITICAL(&g_state_mux);
+                        good_windows = 0;
+                    }
+                }
+            }
         }
     }
 } // namespace
 
 extern "C" void app_main(void)
 {
-    ESP_LOGI(TAG, "Starting PPG HR TinyML dual-core (ESP32-S3 + MAX30102)");
+    ESP_LOGI(TAG, "Starting PPG Hybrid Scheduler (ESP32-S3 + MAX30102)");
 
     if (!tinyml_init())
     {
@@ -755,6 +1208,7 @@ extern "C" void app_main(void)
 
     ESP_ERROR_CHECK(i2c_init());
     ESP_ERROR_CHECK(max30102_init());
+    ESP_ERROR_CHECK(apply_scheduler_state(SCHED_STATE_NORMAL));
 
     xTaskCreatePinnedToCore(
         inference_task,
@@ -774,6 +1228,7 @@ extern "C" void app_main(void)
         if (max30102_fifo_pending(&pending) != ESP_OK)
         {
             consecutive_i2c_errors++;
+            add_decision_freeze_windows(DECISION_FREEZE_ON_ERROR_WINDOWS);
             if (consecutive_i2c_errors >= 5)
             {
                 max30102_recover();
@@ -786,11 +1241,30 @@ extern "C" void app_main(void)
 
         if (pending == 0)
         {
+            bool do_switch = false;
+            scheduler_state_t target_state = SCHED_STATE_NORMAL;
+
+            taskENTER_CRITICAL(&g_state_mux);
+            do_switch = g_switch_pending;
+            target_state = g_desired_state;
+            taskEXIT_CRITICAL(&g_state_mux);
+
+            if (do_switch)
+            {
+                if (apply_scheduler_state(target_state) == ESP_OK)
+                {
+                    taskENTER_CRITICAL(&g_state_mux);
+                    g_switch_pending = false;
+                    taskEXIT_CRITICAL(&g_state_mux);
+                }
+            }
+
             int64_t now = esp_timer_get_time();
             if (now - last_activity_us > 3000000)
             {
                 ESP_LOGW(TAG, "No new MAX30102 samples for >3s. Sensor might be sleeping/reset!");
                 max30102_recover();
+                add_decision_freeze_windows(DECISION_FREEZE_ON_ERROR_WINDOWS);
                 last_activity_us = esp_timer_get_time();
             }
             vTaskDelay(pdMS_TO_TICKS(2));
@@ -811,6 +1285,7 @@ extern "C" void app_main(void)
             else
             {
                 consecutive_i2c_errors++;
+                add_decision_freeze_windows(DECISION_FREEZE_ON_ERROR_WINDOWS);
                 if (consecutive_i2c_errors >= 5)
                 {
                     max30102_recover();

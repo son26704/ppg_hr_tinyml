@@ -21,6 +21,23 @@ namespace
 {
     static const char *TAG = "PPG_TINYML";
 
+    enum run_mode_t
+    {
+        RUN_MODE_FIXED_NORMAL = 0,
+        RUN_MODE_FIXED_HIGH = 1,
+        RUN_MODE_ADAPTIVE = 2,
+    };
+
+#ifndef RUN_MODE
+#define RUN_MODE RUN_MODE_ADAPTIVE
+#endif
+
+    constexpr run_mode_t kRunMode = static_cast<run_mode_t>(RUN_MODE);
+    constexpr bool kAdaptiveEnabled = (kRunMode == RUN_MODE_ADAPTIVE);
+    constexpr bool kTinyMlEnabledByMode = (kRunMode != RUN_MODE_FIXED_NORMAL);
+    constexpr int64_t kPowerReadPeriodUs = 1000LL * 1000LL;
+    constexpr int64_t kSparseLogPeriodUs = 2000LL * 1000LL;
+
     constexpr int kFeatureCount = 16;
     constexpr float kModelFs = 64.0f;
     constexpr int kWindowSec = 8;
@@ -47,6 +64,7 @@ namespace
     constexpr gpio_num_t I2C_SCL = GPIO_NUM_9;
     constexpr uint32_t I2C_FREQ_HZ = 100000;
     constexpr uint8_t MAX30102_ADDR = 0x57;
+    constexpr uint8_t INA219_ADDR = 0x40;
 
     constexpr uint8_t REG_FIFO_WR_PTR = 0x04;
     constexpr uint8_t REG_OVF_COUNTER = 0x05;
@@ -58,6 +76,15 @@ namespace
     constexpr uint8_t REG_LED1_PA = 0x0C;
     constexpr uint8_t REG_LED2_PA = 0x0D;
     constexpr uint8_t REG_PART_ID = 0xFF;
+
+    constexpr uint8_t INA219_REG_CONFIG = 0x00;
+    constexpr uint8_t INA219_REG_SHUNT_VOLTAGE = 0x01;
+    constexpr uint8_t INA219_REG_BUS_VOLTAGE = 0x02;
+    constexpr uint8_t INA219_REG_POWER = 0x03;
+    constexpr uint8_t INA219_REG_CURRENT = 0x04;
+    constexpr uint8_t INA219_REG_CALIBRATION = 0x05;
+    constexpr uint16_t INA219_CONFIG_32V_2A = 0x019F;
+    constexpr uint16_t INA219_CALIB_32V_2A = 4096;
 
     struct max30102_profile_t
     {
@@ -148,6 +175,22 @@ namespace
     static bool g_switch_pending = false;
     static int64_t g_last_state_switch_us = 0;
     static int g_decision_freeze_windows = 0;
+    static bool g_tinyml_ready = false;
+
+    static portMUX_TYPE g_telemetry_mux = portMUX_INITIALIZER_UNLOCKED;
+    static uint32_t g_last_red = 0;
+    static uint32_t g_last_ir = 0;
+    static float g_last_hr_report = 0.0f;
+    static int g_last_hr_source = -1; // 0=dsp, 1=ai
+    static int g_last_quality_pass = -1;
+    static float g_last_difficulty_proxy = 0.0f;
+    static float g_last_ac_best = 0.0f;
+    static float g_last_peak_bpm = 0.0f;
+
+    static float g_last_bus_v = 0.0f;
+    static float g_last_current_ma = 0.0f;
+    static float g_last_power_mw = 0.0f;
+    static bool g_last_power_valid = false;
 
     static float g_win_sensor[kWindowSamplesSensor] = {0};
     static float g_win_model[kWindowSamplesModel] = {0};
@@ -585,6 +628,99 @@ namespace
         return i2c_master_write_read_device(I2C_PORT, MAX30102_ADDR, &reg, 1, buf, len, pdMS_TO_TICKS(1000));
     }
 
+    esp_err_t ina219_write_reg16(uint8_t reg, uint16_t value)
+    {
+        uint8_t data[3] = {
+            reg,
+            static_cast<uint8_t>((value >> 8) & 0xFF),
+            static_cast<uint8_t>(value & 0xFF),
+        };
+        return i2c_master_write_to_device(I2C_PORT, INA219_ADDR, data, sizeof(data), pdMS_TO_TICKS(1000));
+    }
+
+    esp_err_t ina219_read_reg16(uint8_t reg, uint16_t *value)
+    {
+        if (value == nullptr)
+            return ESP_ERR_INVALID_ARG;
+        uint8_t data[2] = {0};
+        ESP_RETURN_ON_ERROR(i2c_master_write_read_device(I2C_PORT, INA219_ADDR, &reg, 1, data, sizeof(data), pdMS_TO_TICKS(1000)), TAG, "ina219 read reg fail");
+        *value = (static_cast<uint16_t>(data[0]) << 8) | static_cast<uint16_t>(data[1]);
+        return ESP_OK;
+    }
+
+    esp_err_t ina219_init()
+    {
+        ESP_RETURN_ON_ERROR(ina219_write_reg16(INA219_REG_CONFIG, INA219_CONFIG_32V_2A), TAG, "ina219 config fail");
+        ESP_RETURN_ON_ERROR(ina219_write_reg16(INA219_REG_CALIBRATION, INA219_CALIB_32V_2A), TAG, "ina219 calib fail");
+        return ESP_OK;
+    }
+
+    esp_err_t ina219_read_power(float *bus_v, float *current_ma, float *power_mw)
+    {
+        if (bus_v == nullptr || current_ma == nullptr || power_mw == nullptr)
+            return ESP_ERR_INVALID_ARG;
+
+        uint16_t bus_raw = 0;
+        uint16_t cur_raw = 0;
+        uint16_t pwr_raw = 0;
+        ESP_RETURN_ON_ERROR(ina219_read_reg16(INA219_REG_BUS_VOLTAGE, &bus_raw), TAG, "ina219 bus fail");
+        ESP_RETURN_ON_ERROR(ina219_read_reg16(INA219_REG_CURRENT, &cur_raw), TAG, "ina219 current fail");
+        ESP_RETURN_ON_ERROR(ina219_read_reg16(INA219_REG_POWER, &pwr_raw), TAG, "ina219 power fail");
+
+        const int16_t signed_cur = static_cast<int16_t>(cur_raw);
+        const float bus = static_cast<float>((bus_raw >> 3) & 0x1FFF) * 0.004f; // 4mV/bit
+        const float current = static_cast<float>(signed_cur) * 0.1f;            // 0.1mA/bit
+        const float power = static_cast<float>(pwr_raw) * 2.0f;                 // 2mW/bit
+
+        *bus_v = bus;
+        *current_ma = current;
+        *power_mw = power;
+        return ESP_OK;
+    }
+
+    int profile_id_from_state(scheduler_state_t state)
+    {
+        return (state == SCHED_STATE_HIGH) ? 0 : 1;
+    }
+
+    void print_sparse_csv_log(int64_t timestamp_ms)
+    {
+        scheduler_state_t state_snapshot;
+        taskENTER_CRITICAL(&g_state_mux);
+        state_snapshot = g_sched_state;
+        taskEXIT_CRITICAL(&g_state_mux);
+
+        uint32_t red_snapshot = 0;
+        uint32_t ir_snapshot = 0;
+        int quality_snapshot = -1;
+        float diff_snapshot = 0.0f;
+        float bus_snapshot = 0.0f;
+        float current_snapshot = 0.0f;
+        float power_snapshot = 0.0f;
+
+        taskENTER_CRITICAL(&g_telemetry_mux);
+        red_snapshot = g_last_red;
+        ir_snapshot = g_last_ir;
+        quality_snapshot = g_last_quality_pass;
+        diff_snapshot = g_last_difficulty_proxy;
+        bus_snapshot = g_last_bus_v;
+        current_snapshot = g_last_current_ma;
+        power_snapshot = g_last_power_mw;
+        taskEXIT_CRITICAL(&g_telemetry_mux);
+
+        printf("%lld,%d,%d,%d,%.3f,%u,%u,%.3f,%.3f,%.3f\n",
+               static_cast<long long>(timestamp_ms),
+               static_cast<int>(state_snapshot),
+               profile_id_from_state(state_snapshot),
+               quality_snapshot,
+               diff_snapshot,
+               static_cast<unsigned>(red_snapshot),
+               static_cast<unsigned>(ir_snapshot),
+               bus_snapshot,
+               current_snapshot,
+               power_snapshot);
+    }
+
     esp_err_t max30102_apply_profile(const max30102_profile_t *profile)
     {
         if (profile == nullptr)
@@ -920,6 +1056,9 @@ namespace
 
     bool run_tinyml_on_features(float *y_bpm, int8_t *y_q)
     {
+        if (!g_tinyml_ready)
+            return false;
+
         const float in_scale = g_input->params.scale;
         const int in_zp = g_input->params.zero_point;
         for (int i = 0; i < kFeatureCount; ++i)
@@ -1014,6 +1153,13 @@ namespace
             const bool severe_motion_fail = (fail_reason == QFR_AMP_FAIL) || (fail_reason == QFR_HR_RANGE_FAIL);
             const bool mild_fail = (fail_reason == QFR_AC_FAIL) || (fail_reason == QFR_CONSIST_FAIL);
 
+            taskENTER_CRITICAL(&g_telemetry_mux);
+            g_last_quality_pass = quality_ok ? 1 : 0;
+            g_last_difficulty_proxy = difficulty_proxy;
+            g_last_ac_best = ac_best;
+            g_last_peak_bpm = peak_bpm;
+            taskEXIT_CRITICAL(&g_telemetry_mux);
+
             scheduler_state_t state_snapshot;
             int64_t last_switch_snapshot = 0;
             int freeze_windows_snapshot = 0;
@@ -1055,6 +1201,11 @@ namespace
                              ac_best_hr,
                              std_hp,
                              ptp_hp);
+
+                    taskENTER_CRITICAL(&g_telemetry_mux);
+                    g_last_hr_report = g_bpm_ema;
+                    g_last_hr_source = 0;
+                    taskEXIT_CRITICAL(&g_telemetry_mux);
                 }
                 else
                 {
@@ -1128,7 +1279,7 @@ namespace
                     gray_windows = 0;
                 }
 
-                if ((bad_windows >= SCHED_BAD_WINDOWS_TO_UP || gray_windows >= GRAY_WINDOWS_TO_UP) && dwell_ok)
+                if (kAdaptiveEnabled && (bad_windows >= SCHED_BAD_WINDOWS_TO_UP || gray_windows >= GRAY_WINDOWS_TO_UP) && dwell_ok)
                 {
                     taskENTER_CRITICAL(&g_state_mux);
                     g_desired_state = SCHED_STATE_HIGH;
@@ -1142,35 +1293,35 @@ namespace
             }
             else
             {
-                if (!no_contact)
+                if (!no_contact && g_tinyml_ready)
                 {
                     float ai_bpm = 0.0f;
                     int8_t y_q = 0;
                     if (run_tinyml_on_features(&ai_bpm, &y_q))
                     {
-                        float ai_bpm = 0.0f;
-                        int8_t y_q = 0;
-                        if (run_tinyml_on_features(&ai_bpm, &y_q))
+                        if (!g_has_bpm_ema)
                         {
-                            if (!g_has_bpm_ema)
-                            {
-                                g_bpm_ema = ai_bpm;
-                                g_has_bpm_ema = true;
-                            }
-                            else
-                            {
-                                constexpr float kAiEmaAlpha = 0.15f; // Trọng số AI rất thấp để chống nhảy số
-                                g_bpm_ema = (kAiEmaAlpha * ai_bpm) + ((1.0f - kAiEmaAlpha) * g_bpm_ema);
-                            }
-
-                            ESP_LOGI(TAG,
-                                     "AI_ASSIST_HR=%.2f | raw_ai=%.2f | y_q=%d | dsp_peak=%.1f ac=%.3f",
-                                     g_bpm_ema,
-                                     ai_bpm,
-                                     static_cast<int>(y_q),
-                                     peak_bpm,
-                                     ac_best);
+                            g_bpm_ema = ai_bpm;
+                            g_has_bpm_ema = true;
                         }
+                        else
+                        {
+                            constexpr float kAiEmaAlpha = 0.15f;
+                            g_bpm_ema = (kAiEmaAlpha * ai_bpm) + ((1.0f - kAiEmaAlpha) * g_bpm_ema);
+                        }
+
+                        ESP_LOGI(TAG,
+                                 "AI_ASSIST_HR=%.2f | raw_ai=%.2f | y_q=%d | dsp_peak=%.1f ac=%.3f",
+                                 g_bpm_ema,
+                                 ai_bpm,
+                                 static_cast<int>(y_q),
+                                 peak_bpm,
+                                 ac_best);
+
+                        taskENTER_CRITICAL(&g_telemetry_mux);
+                        g_last_hr_report = g_bpm_ema;
+                        g_last_hr_source = 1;
+                        taskEXIT_CRITICAL(&g_telemetry_mux);
                     }
                 }
 
@@ -1199,7 +1350,7 @@ namespace
                         good_windows = 0;
                     }
 
-                    if (good_windows >= SCHED_GOOD_WINDOWS_TO_DOWN && dwell_ok)
+                    if (kAdaptiveEnabled && good_windows >= SCHED_GOOD_WINDOWS_TO_DOWN && dwell_ok)
                     {
                         taskENTER_CRITICAL(&g_state_mux);
                         g_desired_state = SCHED_STATE_NORMAL;
@@ -1215,17 +1366,37 @@ namespace
 
 extern "C" void app_main(void)
 {
-    ESP_LOGI(TAG, "Starting PPG Hybrid Scheduler (ESP32-S3 + MAX30102)");
+    ESP_LOGI(TAG, "Starting PPG Scheduler (mode=%d)", static_cast<int>(kRunMode));
 
-    if (!tinyml_init())
+    if (kTinyMlEnabledByMode)
     {
-        ESP_LOGE(TAG, "TinyML init failed");
-        return;
+        if (!tinyml_init())
+        {
+            ESP_LOGE(TAG, "TinyML init failed");
+            return;
+        }
+        g_tinyml_ready = true;
+    }
+    else
+    {
+        ESP_LOGI(TAG, "TinyML disabled for fixed-normal baseline mode");
     }
 
     ESP_ERROR_CHECK(i2c_init());
+    if (ina219_init() == ESP_OK)
+    {
+        ESP_LOGI(TAG, "INA219 ready");
+    }
+    else
+    {
+        ESP_LOGW(TAG, "INA219 init failed, power fields will stay zero");
+    }
     ESP_ERROR_CHECK(max30102_init());
-    ESP_ERROR_CHECK(apply_scheduler_state(SCHED_STATE_NORMAL));
+
+    scheduler_state_t initial_state = SCHED_STATE_NORMAL;
+    if (kRunMode == RUN_MODE_FIXED_HIGH)
+        initial_state = SCHED_STATE_HIGH;
+    ESP_ERROR_CHECK(apply_scheduler_state(initial_state));
 
     xTaskCreatePinnedToCore(
         inference_task,
@@ -1237,6 +1408,8 @@ extern "C" void app_main(void)
         1);
 
     int64_t last_activity_us = esp_timer_get_time();
+    int64_t last_power_read_us = 0;
+    int64_t last_sparse_log_us = 0;
     int consecutive_i2c_errors = 0;
 
     while (true)
@@ -1258,17 +1431,17 @@ extern "C" void app_main(void)
 
         if (pending == 0)
         {
-            bool do_switch = false;
-            scheduler_state_t target_state = SCHED_STATE_NORMAL;
-
-            taskENTER_CRITICAL(&g_state_mux);
-            do_switch = g_switch_pending;
-            target_state = g_desired_state;
-            taskEXIT_CRITICAL(&g_state_mux);
-
-            if (do_switch)
+            if (kAdaptiveEnabled)
             {
-                if (apply_scheduler_state(target_state) == ESP_OK)
+                bool do_switch = false;
+                scheduler_state_t target_state = SCHED_STATE_NORMAL;
+
+                taskENTER_CRITICAL(&g_state_mux);
+                do_switch = g_switch_pending;
+                target_state = g_desired_state;
+                taskEXIT_CRITICAL(&g_state_mux);
+
+                if (do_switch && apply_scheduler_state(target_state) == ESP_OK)
                 {
                     taskENTER_CRITICAL(&g_state_mux);
                     g_switch_pending = false;
@@ -1277,6 +1450,29 @@ extern "C" void app_main(void)
             }
 
             int64_t now = esp_timer_get_time();
+            if (now - last_power_read_us >= kPowerReadPeriodUs)
+            {
+                float bus_v = 0.0f;
+                float current_ma = 0.0f;
+                float power_mw = 0.0f;
+                if (ina219_read_power(&bus_v, &current_ma, &power_mw) == ESP_OK)
+                {
+                    taskENTER_CRITICAL(&g_telemetry_mux);
+                    g_last_bus_v = bus_v;
+                    g_last_current_ma = current_ma;
+                    g_last_power_mw = power_mw;
+                    g_last_power_valid = true;
+                    taskEXIT_CRITICAL(&g_telemetry_mux);
+                }
+                last_power_read_us = now;
+            }
+
+            if (now - last_sparse_log_us >= kSparseLogPeriodUs)
+            {
+                print_sparse_csv_log(now / 1000LL);
+                last_sparse_log_us = now;
+            }
+
             if (now - last_activity_us > 3000000)
             {
                 ESP_LOGW(TAG, "No new MAX30102 samples for >3s. Sensor might be sleeping/reset!");
@@ -1295,7 +1491,11 @@ extern "C" void app_main(void)
             uint32_t ir = 0;
             if (max30102_read_sample(&red, &ir) == ESP_OK)
             {
-                (void)red;
+                taskENTER_CRITICAL(&g_telemetry_mux);
+                g_last_red = red;
+                g_last_ir = ir;
+                taskEXIT_CRITICAL(&g_telemetry_mux);
+
                 push_ir_sample(static_cast<float>(ir));
                 last_activity_us = esp_timer_get_time();
             }
@@ -1310,6 +1510,30 @@ extern "C" void app_main(void)
                 }
                 break;
             }
+        }
+
+        const int64_t now = esp_timer_get_time();
+        if (now - last_power_read_us >= kPowerReadPeriodUs)
+        {
+            float bus_v = 0.0f;
+            float current_ma = 0.0f;
+            float power_mw = 0.0f;
+            if (ina219_read_power(&bus_v, &current_ma, &power_mw) == ESP_OK)
+            {
+                taskENTER_CRITICAL(&g_telemetry_mux);
+                g_last_bus_v = bus_v;
+                g_last_current_ma = current_ma;
+                g_last_power_mw = power_mw;
+                g_last_power_valid = true;
+                taskEXIT_CRITICAL(&g_telemetry_mux);
+            }
+            last_power_read_us = now;
+        }
+
+        if (now - last_sparse_log_us >= kSparseLogPeriodUs)
+        {
+            print_sparse_csv_log(now / 1000LL);
+            last_sparse_log_us = now;
         }
 
         vTaskDelay(pdMS_TO_TICKS(1));

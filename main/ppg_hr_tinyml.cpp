@@ -29,7 +29,7 @@ namespace
     };
 
 #ifndef RUN_MODE
-#define RUN_MODE RUN_MODE_ADAPTIVE
+#define RUN_MODE RUN_MODE_FIXED_HIGH
 #endif
 
     constexpr run_mode_t kRunMode = static_cast<run_mode_t>(RUN_MODE);
@@ -131,6 +131,15 @@ namespace
         QFR_AC_FAIL,
         QFR_HR_RANGE_FAIL,
         QFR_CONSIST_FAIL,
+    };
+
+    struct window_metrics_t
+    {
+        float peak_bpm = 0.0f;
+        float ac_best = 0.0f;
+        float ac_best_hr = 0.0f;
+        float std_hp = 0.0f;
+        float ptp_hp = 0.0f;
     };
 
     constexpr float SCHED_STD_MIN = 250.0f;
@@ -1031,8 +1040,11 @@ namespace
         *ptp_hp = hp_max - hp_min;
     }
 
-    bool compute_window_features(float *peak_bpm, float *ac_best, float *std_hp, float *ptp_hp)
+    bool compute_window_metrics(window_metrics_t *metrics, bool need_full_features)
     {
+        if (metrics == nullptr)
+            return false;
+
         int window_samples_snapshot;
         int fs_snapshot;
         taskENTER_CRITICAL(&g_state_mux);
@@ -1043,14 +1055,61 @@ namespace
         if (!snapshot_window(g_win_sensor, window_samples_snapshot))
             return false;
 
-        compute_hp_metrics(g_win_sensor, window_samples_snapshot, static_cast<float>(fs_snapshot), std_hp, ptp_hp);
+        const float fs = static_cast<float>(fs_snapshot);
+        compute_hp_metrics(g_win_sensor, window_samples_snapshot, fs, &metrics->std_hp, &metrics->ptp_hp);
 
         resample_linear(g_win_sensor, window_samples_snapshot, g_win_model, kWindowSamplesModel);
 
+        memcpy(g_scratch_x, g_win_model, sizeof(float) * static_cast<size_t>(kWindowSamplesModel));
+        detrend_linear(g_scratch_x, kWindowSamplesModel);
+        simple_bandpass(g_scratch_x, kWindowSamplesModel, kModelFs);
+        robust_zscore(g_scratch_x, kWindowSamplesModel);
+
+        const float mean = mean_of(g_scratch_x, kWindowSamplesModel);
+        const float std = std_of(g_scratch_x, kWindowSamplesModel, mean);
+        const int min_distance = (static_cast<int>(kModelFs * 60.0f / 140.0f) > 1) ? static_cast<int>(kModelFs * 60.0f / 140.0f) : 1;
+        const float prominence = ((0.25f * std) > 0.12f) ? (0.25f * std) : 0.12f;
+        const int n_peaks = find_peaks_simple(
+            g_scratch_x,
+            kWindowSamplesModel,
+            min_distance,
+            prominence,
+            g_scratch_peaks,
+            g_scratch_proms,
+            128);
+        metrics->peak_bpm = (static_cast<float>(n_peaks) / (static_cast<float>(kWindowSamplesModel) / kModelFs)) * 60.0f;
+
+        normalized_autocorr(g_scratch_x, kWindowSamplesModel, g_scratch_ac);
+        const int lag_min = static_cast<int>(kModelFs * 60.0f / 180.0f);
+        int lag_max = static_cast<int>(kModelFs * 60.0f / 40.0f);
+        if (lag_max > kWindowSamplesModel - 1)
+            lag_max = kWindowSamplesModel - 1;
+
+        metrics->ac_best = 0.0f;
+        metrics->ac_best_hr = 0.0f;
+        if (lag_max > lag_min)
+        {
+            int best_lag = lag_min;
+            float best_val = g_scratch_ac[lag_min];
+            for (int lag = lag_min + 1; lag <= lag_max; ++lag)
+            {
+                if (g_scratch_ac[lag] > best_val)
+                {
+                    best_val = g_scratch_ac[lag];
+                    best_lag = lag;
+                }
+            }
+            metrics->ac_best = best_val;
+            metrics->ac_best_hr = 60.0f / (static_cast<float>(best_lag) / kModelFs);
+        }
+
+        if (!need_full_features)
+            return true;
         extract_ppg_features(g_win_model, kWindowSamplesModel, kModelFs, g_feat);
 
-        *peak_bpm = g_feat[7] * 60.0f;
-        *ac_best = g_feat[11];
+        metrics->peak_bpm = g_feat[7] * 60.0f;
+        metrics->ac_best = g_feat[11];
+        metrics->ac_best_hr = g_feat[12];
         return true;
     }
 
@@ -1099,20 +1158,35 @@ namespace
         {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-            float peak_bpm = 0.0f;
-            float ac_best = 0.0f;
-            float std_hp = 0.0f;
-            float ptp_hp = 0.0f;
+            scheduler_state_t state_snapshot;
+            int64_t last_switch_snapshot = 0;
+            int freeze_windows_snapshot = 0;
+            taskENTER_CRITICAL(&g_state_mux);
+            state_snapshot = g_sched_state;
+            last_switch_snapshot = g_last_state_switch_us;
+            freeze_windows_snapshot = g_decision_freeze_windows;
+            if (g_decision_freeze_windows > 0)
+            {
+                g_decision_freeze_windows--;
+            }
+            taskEXIT_CRITICAL(&g_state_mux);
 
-            if (!compute_window_features(&peak_bpm, &ac_best, &std_hp, &ptp_hp))
+            window_metrics_t metrics = {};
+            const bool need_full_features = (state_snapshot == SCHED_STATE_HIGH);
+            if (!compute_window_metrics(&metrics, need_full_features))
                 continue;
+
+            const float peak_bpm = metrics.peak_bpm;
+            const float ac_best = metrics.ac_best;
+            const float std_hp = metrics.std_hp;
+            const float ptp_hp = metrics.ptp_hp;
+            const float ac_best_hr = metrics.ac_best_hr;
 
             const bool amplitude_ok = (std_hp >= SCHED_STD_MIN) && (ptp_hp >= SCHED_PTP_MIN) && (ptp_hp <= SCHED_PTP_MAX);
             const bool periodic_ok = (ac_best >= SCHED_AC_MIN);
             const bool hr_range_ok = (peak_bpm >= 40.0f) && (peak_bpm <= 180.0f);
             const bool quality_ok = amplitude_ok && periodic_ok && hr_range_ok;
             const float difficulty_proxy = amplitude_ok ? clampf(1.0f - ac_best, 0.0f, 1.0f) : 1.0f;
-            const float ac_best_hr = g_feat[12];
             const bool ac_hr_valid = (ac_best_hr >= 40.0f) && (ac_best_hr <= 180.0f) &&
                                      (ac_best_hr > AC_HR_CLAMP_LOW) && (ac_best_hr < AC_HR_CLAMP_HIGH);
             const bool hr_consistent = ac_hr_valid && (fabsf(peak_bpm - ac_best_hr) <= HR_CONSIST_MAX_DIFF_BPM);
@@ -1160,18 +1234,6 @@ namespace
             g_last_peak_bpm = peak_bpm;
             taskEXIT_CRITICAL(&g_telemetry_mux);
 
-            scheduler_state_t state_snapshot;
-            int64_t last_switch_snapshot = 0;
-            int freeze_windows_snapshot = 0;
-            taskENTER_CRITICAL(&g_state_mux);
-            state_snapshot = g_sched_state;
-            last_switch_snapshot = g_last_state_switch_us;
-            freeze_windows_snapshot = g_decision_freeze_windows;
-            if (g_decision_freeze_windows > 0)
-            {
-                g_decision_freeze_windows--;
-            }
-            taskEXIT_CRITICAL(&g_state_mux);
             const int64_t now_us = esp_timer_get_time();
             const bool dwell_ok = (now_us - last_switch_snapshot) >= SCHED_MIN_STATE_DWELL_US;
             const bool decision_frozen = freeze_windows_snapshot > 0;
@@ -1393,9 +1455,9 @@ extern "C" void app_main(void)
     }
     ESP_ERROR_CHECK(max30102_init());
 
-    scheduler_state_t initial_state = SCHED_STATE_NORMAL;
-    if (kRunMode == RUN_MODE_FIXED_HIGH)
-        initial_state = SCHED_STATE_HIGH;
+    scheduler_state_t initial_state = SCHED_STATE_HIGH;
+    if (kRunMode == RUN_MODE_FIXED_NORMAL)
+        initial_state = SCHED_STATE_NORMAL;
     ESP_ERROR_CHECK(apply_scheduler_state(initial_state));
 
     xTaskCreatePinnedToCore(

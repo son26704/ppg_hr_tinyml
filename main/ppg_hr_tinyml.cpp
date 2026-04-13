@@ -29,7 +29,7 @@ namespace
     };
 
 #ifndef RUN_MODE
-#define RUN_MODE RUN_MODE_FIXED_HIGH
+#define RUN_MODE RUN_MODE_ADAPTIVE
 #endif
 
     constexpr run_mode_t kRunMode = static_cast<run_mode_t>(RUN_MODE);
@@ -1060,6 +1060,15 @@ namespace
 
         resample_linear(g_win_sensor, window_samples_snapshot, g_win_model, kWindowSamplesModel);
 
+        if (need_full_features)
+        {
+            extract_ppg_features(g_win_model, kWindowSamplesModel, kModelFs, g_feat);
+            metrics->peak_bpm = g_feat[7] * 60.0f;
+            metrics->ac_best = g_feat[11];
+            metrics->ac_best_hr = g_feat[12];
+            return true;
+        }
+
         memcpy(g_scratch_x, g_win_model, sizeof(float) * static_cast<size_t>(kWindowSamplesModel));
         detrend_linear(g_scratch_x, kWindowSamplesModel);
         simple_bandpass(g_scratch_x, kWindowSamplesModel, kModelFs);
@@ -1102,14 +1111,6 @@ namespace
             metrics->ac_best = best_val;
             metrics->ac_best_hr = 60.0f / (static_cast<float>(best_lag) / kModelFs);
         }
-
-        if (!need_full_features)
-            return true;
-        extract_ppg_features(g_win_model, kWindowSamplesModel, kModelFs, g_feat);
-
-        metrics->peak_bpm = g_feat[7] * 60.0f;
-        metrics->ac_best = g_feat[11];
-        metrics->ac_best_hr = g_feat[12];
         return true;
     }
 

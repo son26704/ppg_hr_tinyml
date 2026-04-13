@@ -29,13 +29,15 @@ namespace
     };
 
 #ifndef RUN_MODE
-#define RUN_MODE RUN_MODE_ADAPTIVE
+#define RUN_MODE RUN_MODE_FIXED_HIGH
 #endif
 
     constexpr run_mode_t kRunMode = static_cast<run_mode_t>(RUN_MODE);
     constexpr bool kAdaptiveEnabled = (kRunMode == RUN_MODE_ADAPTIVE);
     constexpr bool kTinyMlEnabledByMode = (kRunMode != RUN_MODE_FIXED_NORMAL);
-    constexpr int64_t kPowerReadPeriodUs = 1000LL * 1000LL;
+    // Sample INA219 more often and report a windowed average in the sparse CSV log.
+    // This avoids phase-locking a near-instantaneous power read to the 2 s AI/DSP burst.
+    constexpr int64_t kPowerReadPeriodUs = 250LL * 1000LL;
     constexpr int64_t kSparseLogPeriodUs = 2000LL * 1000LL;
 
     constexpr int kFeatureCount = 16;
@@ -140,6 +142,14 @@ namespace
         float ac_best_hr = 0.0f;
         float std_hp = 0.0f;
         float ptp_hp = 0.0f;
+    };
+
+    struct power_window_accumulator_t
+    {
+        float bus_sum = 0.0f;
+        float current_sum = 0.0f;
+        float power_sum = 0.0f;
+        int count = 0;
     };
 
     constexpr float SCHED_STD_MIN = 250.0f;
@@ -685,6 +695,45 @@ namespace
         *current_ma = current;
         *power_mw = power;
         return ESP_OK;
+    }
+
+    inline void accumulate_power_sample(power_window_accumulator_t &acc, float bus_v, float current_ma, float power_mw)
+    {
+        acc.bus_sum += bus_v;
+        acc.current_sum += current_ma;
+        acc.power_sum += power_mw;
+        acc.count++;
+    }
+
+    inline void publish_power_average(power_window_accumulator_t &acc)
+    {
+        if (acc.count <= 0)
+            return;
+
+        const float inv_count = 1.0f / static_cast<float>(acc.count);
+        taskENTER_CRITICAL(&g_telemetry_mux);
+        g_last_bus_v = acc.bus_sum * inv_count;
+        g_last_current_ma = acc.current_sum * inv_count;
+        g_last_power_mw = acc.power_sum * inv_count;
+        g_last_power_valid = true;
+        taskEXIT_CRITICAL(&g_telemetry_mux);
+
+        acc = {};
+    }
+
+    inline void maybe_sample_power(int64_t now_us, int64_t &last_power_read_us, power_window_accumulator_t &acc)
+    {
+        if ((now_us - last_power_read_us) < kPowerReadPeriodUs)
+            return;
+
+        float bus_v = 0.0f;
+        float current_ma = 0.0f;
+        float power_mw = 0.0f;
+        if (ina219_read_power(&bus_v, &current_ma, &power_mw) == ESP_OK)
+        {
+            accumulate_power_sample(acc, bus_v, current_ma, power_mw);
+        }
+        last_power_read_us = now_us;
     }
 
     int profile_id_from_state(scheduler_state_t state)
@@ -1474,6 +1523,7 @@ extern "C" void app_main(void)
     int64_t last_power_read_us = 0;
     int64_t last_sparse_log_us = 0;
     int consecutive_i2c_errors = 0;
+    power_window_accumulator_t power_window_acc = {};
 
     while (true)
     {
@@ -1513,25 +1563,11 @@ extern "C" void app_main(void)
             }
 
             int64_t now = esp_timer_get_time();
-            if (now - last_power_read_us >= kPowerReadPeriodUs)
-            {
-                float bus_v = 0.0f;
-                float current_ma = 0.0f;
-                float power_mw = 0.0f;
-                if (ina219_read_power(&bus_v, &current_ma, &power_mw) == ESP_OK)
-                {
-                    taskENTER_CRITICAL(&g_telemetry_mux);
-                    g_last_bus_v = bus_v;
-                    g_last_current_ma = current_ma;
-                    g_last_power_mw = power_mw;
-                    g_last_power_valid = true;
-                    taskEXIT_CRITICAL(&g_telemetry_mux);
-                }
-                last_power_read_us = now;
-            }
+            maybe_sample_power(now, last_power_read_us, power_window_acc);
 
             if (now - last_sparse_log_us >= kSparseLogPeriodUs)
             {
+                publish_power_average(power_window_acc);
                 print_sparse_csv_log(now / 1000LL);
                 last_sparse_log_us = now;
             }
@@ -1576,25 +1612,11 @@ extern "C" void app_main(void)
         }
 
         const int64_t now = esp_timer_get_time();
-        if (now - last_power_read_us >= kPowerReadPeriodUs)
-        {
-            float bus_v = 0.0f;
-            float current_ma = 0.0f;
-            float power_mw = 0.0f;
-            if (ina219_read_power(&bus_v, &current_ma, &power_mw) == ESP_OK)
-            {
-                taskENTER_CRITICAL(&g_telemetry_mux);
-                g_last_bus_v = bus_v;
-                g_last_current_ma = current_ma;
-                g_last_power_mw = power_mw;
-                g_last_power_valid = true;
-                taskEXIT_CRITICAL(&g_telemetry_mux);
-            }
-            last_power_read_us = now;
-        }
+        maybe_sample_power(now, last_power_read_us, power_window_acc);
 
         if (now - last_sparse_log_us >= kSparseLogPeriodUs)
         {
+            publish_power_average(power_window_acc);
             print_sparse_csv_log(now / 1000LL);
             last_sparse_log_us = now;
         }

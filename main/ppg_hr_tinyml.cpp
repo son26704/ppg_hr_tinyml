@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "driver/i2c.h"
 #include "esp_check.h"
 #include "esp_err.h"
@@ -35,10 +36,9 @@ namespace
     constexpr run_mode_t kRunMode = static_cast<run_mode_t>(RUN_MODE);
     constexpr bool kAdaptiveEnabled = (kRunMode == RUN_MODE_ADAPTIVE);
     constexpr bool kTinyMlEnabledByMode = (kRunMode != RUN_MODE_FIXED_NORMAL);
-    // Sample INA219 more often and report a windowed average in the sparse CSV log.
-    // This avoids phase-locking a near-instantaneous power read to the 2 s AI/DSP burst.
-    constexpr int64_t kPowerReadPeriodUs = 250LL * 1000LL;
     constexpr int64_t kSparseLogPeriodUs = 2000LL * 1000LL;
+    constexpr gpio_num_t PROFILING_FEATURE_GPIO = GPIO_NUM_10;
+    constexpr gpio_num_t PROFILING_INVOKE_GPIO = GPIO_NUM_11;
 
     constexpr int kFeatureCount = 16;
     constexpr float kModelFs = 64.0f;
@@ -66,8 +66,7 @@ namespace
     constexpr gpio_num_t I2C_SCL = GPIO_NUM_9;
     constexpr uint32_t I2C_FREQ_HZ = 100000;
     constexpr uint8_t MAX30102_ADDR = 0x57;
-    constexpr uint8_t INA219_ADDR = 0x40;
-
+    
     constexpr uint8_t REG_FIFO_WR_PTR = 0x04;
     constexpr uint8_t REG_OVF_COUNTER = 0x05;
     constexpr uint8_t REG_FIFO_RD_PTR = 0x06;
@@ -78,15 +77,6 @@ namespace
     constexpr uint8_t REG_LED1_PA = 0x0C;
     constexpr uint8_t REG_LED2_PA = 0x0D;
     constexpr uint8_t REG_PART_ID = 0xFF;
-
-    constexpr uint8_t INA219_REG_CONFIG = 0x00;
-    constexpr uint8_t INA219_REG_SHUNT_VOLTAGE = 0x01;
-    constexpr uint8_t INA219_REG_BUS_VOLTAGE = 0x02;
-    constexpr uint8_t INA219_REG_POWER = 0x03;
-    constexpr uint8_t INA219_REG_CURRENT = 0x04;
-    constexpr uint8_t INA219_REG_CALIBRATION = 0x05;
-    constexpr uint16_t INA219_CONFIG_32V_2A = 0x019F;
-    constexpr uint16_t INA219_CALIB_32V_2A = 4096;
 
     struct max30102_profile_t
     {
@@ -143,13 +133,20 @@ namespace
         float std_hp = 0.0f;
         float ptp_hp = 0.0f;
     };
-
-    struct power_window_accumulator_t
+    struct profiling_pulse_t
     {
-        float bus_sum = 0.0f;
-        float current_sum = 0.0f;
-        float power_sum = 0.0f;
-        int count = 0;
+        explicit profiling_pulse_t(gpio_num_t pin) : pin_(pin)
+        {
+            gpio_set_level(pin_, 1);
+        }
+
+        ~profiling_pulse_t()
+        {
+            gpio_set_level(pin_, 0);
+        }
+
+    private:
+        gpio_num_t pin_;
     };
 
     constexpr float SCHED_STD_MIN = 250.0f;
@@ -206,11 +203,7 @@ namespace
     static float g_last_ac_best = 0.0f;
     static float g_last_peak_bpm = 0.0f;
 
-    static float g_last_bus_v = 0.0f;
-    static float g_last_current_ma = 0.0f;
-    static float g_last_power_mw = 0.0f;
-    static bool g_last_power_valid = false;
-
+                
     static float g_win_sensor[kWindowSamplesSensor] = {0};
     static float g_win_model[kWindowSamplesModel] = {0};
     static float g_feat[kFeatureCount] = {0};
@@ -646,96 +639,6 @@ namespace
     {
         return i2c_master_write_read_device(I2C_PORT, MAX30102_ADDR, &reg, 1, buf, len, pdMS_TO_TICKS(1000));
     }
-
-    esp_err_t ina219_write_reg16(uint8_t reg, uint16_t value)
-    {
-        uint8_t data[3] = {
-            reg,
-            static_cast<uint8_t>((value >> 8) & 0xFF),
-            static_cast<uint8_t>(value & 0xFF),
-        };
-        return i2c_master_write_to_device(I2C_PORT, INA219_ADDR, data, sizeof(data), pdMS_TO_TICKS(1000));
-    }
-
-    esp_err_t ina219_read_reg16(uint8_t reg, uint16_t *value)
-    {
-        if (value == nullptr)
-            return ESP_ERR_INVALID_ARG;
-        uint8_t data[2] = {0};
-        ESP_RETURN_ON_ERROR(i2c_master_write_read_device(I2C_PORT, INA219_ADDR, &reg, 1, data, sizeof(data), pdMS_TO_TICKS(1000)), TAG, "ina219 read reg fail");
-        *value = (static_cast<uint16_t>(data[0]) << 8) | static_cast<uint16_t>(data[1]);
-        return ESP_OK;
-    }
-
-    esp_err_t ina219_init()
-    {
-        ESP_RETURN_ON_ERROR(ina219_write_reg16(INA219_REG_CONFIG, INA219_CONFIG_32V_2A), TAG, "ina219 config fail");
-        ESP_RETURN_ON_ERROR(ina219_write_reg16(INA219_REG_CALIBRATION, INA219_CALIB_32V_2A), TAG, "ina219 calib fail");
-        return ESP_OK;
-    }
-
-    esp_err_t ina219_read_power(float *bus_v, float *current_ma, float *power_mw)
-    {
-        if (bus_v == nullptr || current_ma == nullptr || power_mw == nullptr)
-            return ESP_ERR_INVALID_ARG;
-
-        uint16_t bus_raw = 0;
-        uint16_t cur_raw = 0;
-        uint16_t pwr_raw = 0;
-        ESP_RETURN_ON_ERROR(ina219_read_reg16(INA219_REG_BUS_VOLTAGE, &bus_raw), TAG, "ina219 bus fail");
-        ESP_RETURN_ON_ERROR(ina219_read_reg16(INA219_REG_CURRENT, &cur_raw), TAG, "ina219 current fail");
-        ESP_RETURN_ON_ERROR(ina219_read_reg16(INA219_REG_POWER, &pwr_raw), TAG, "ina219 power fail");
-
-        const int16_t signed_cur = static_cast<int16_t>(cur_raw);
-        const float bus = static_cast<float>((bus_raw >> 3) & 0x1FFF) * 0.004f; // 4mV/bit
-        const float current = static_cast<float>(signed_cur) * 0.1f;            // 0.1mA/bit
-        const float power = static_cast<float>(pwr_raw) * 2.0f;                 // 2mW/bit
-
-        *bus_v = bus;
-        *current_ma = current;
-        *power_mw = power;
-        return ESP_OK;
-    }
-
-    inline void accumulate_power_sample(power_window_accumulator_t &acc, float bus_v, float current_ma, float power_mw)
-    {
-        acc.bus_sum += bus_v;
-        acc.current_sum += current_ma;
-        acc.power_sum += power_mw;
-        acc.count++;
-    }
-
-    inline void publish_power_average(power_window_accumulator_t &acc)
-    {
-        if (acc.count <= 0)
-            return;
-
-        const float inv_count = 1.0f / static_cast<float>(acc.count);
-        taskENTER_CRITICAL(&g_telemetry_mux);
-        g_last_bus_v = acc.bus_sum * inv_count;
-        g_last_current_ma = acc.current_sum * inv_count;
-        g_last_power_mw = acc.power_sum * inv_count;
-        g_last_power_valid = true;
-        taskEXIT_CRITICAL(&g_telemetry_mux);
-
-        acc = {};
-    }
-
-    inline void maybe_sample_power(int64_t now_us, int64_t &last_power_read_us, power_window_accumulator_t &acc)
-    {
-        if ((now_us - last_power_read_us) < kPowerReadPeriodUs)
-            return;
-
-        float bus_v = 0.0f;
-        float current_ma = 0.0f;
-        float power_mw = 0.0f;
-        if (ina219_read_power(&bus_v, &current_ma, &power_mw) == ESP_OK)
-        {
-            accumulate_power_sample(acc, bus_v, current_ma, power_mw);
-        }
-        last_power_read_us = now_us;
-    }
-
     int profile_id_from_state(scheduler_state_t state)
     {
         return (state == SCHED_STATE_HIGH) ? 0 : 1;
@@ -752,31 +655,22 @@ namespace
         uint32_t ir_snapshot = 0;
         int quality_snapshot = -1;
         float diff_snapshot = 0.0f;
-        float bus_snapshot = 0.0f;
-        float current_snapshot = 0.0f;
-        float power_snapshot = 0.0f;
 
         taskENTER_CRITICAL(&g_telemetry_mux);
         red_snapshot = g_last_red;
         ir_snapshot = g_last_ir;
         quality_snapshot = g_last_quality_pass;
         diff_snapshot = g_last_difficulty_proxy;
-        bus_snapshot = g_last_bus_v;
-        current_snapshot = g_last_current_ma;
-        power_snapshot = g_last_power_mw;
         taskEXIT_CRITICAL(&g_telemetry_mux);
 
-        printf("%lld,%d,%d,%d,%.3f,%u,%u,%.3f,%.3f,%.3f\n",
+        printf("%lld,%d,%d,%d,%.3f,%u,%u\n",
                static_cast<long long>(timestamp_ms),
                static_cast<int>(state_snapshot),
                profile_id_from_state(state_snapshot),
                quality_snapshot,
                diff_snapshot,
                static_cast<unsigned>(red_snapshot),
-               static_cast<unsigned>(ir_snapshot),
-               bus_snapshot,
-               current_snapshot,
-               power_snapshot);
+               static_cast<unsigned>(ir_snapshot));
     }
 
     esp_err_t max30102_apply_profile(const max30102_profile_t *profile)
@@ -1111,6 +1005,7 @@ namespace
 
         if (need_full_features)
         {
+            profiling_pulse_t feature_pulse(PROFILING_FEATURE_GPIO);
             extract_ppg_features(g_win_model, kWindowSamplesModel, kModelFs, g_feat);
             metrics->peak_bpm = g_feat[7] * 60.0f;
             metrics->ac_best = g_feat[11];
@@ -1183,10 +1078,13 @@ namespace
             g_input->data.int8[i] = static_cast<int8_t>(qi);
         }
 
-        if (g_interpreter->Invoke() != kTfLiteOk)
         {
-            ESP_LOGE(TAG, "Invoke failed");
-            return false;
+            profiling_pulse_t invoke_pulse(PROFILING_INVOKE_GPIO);
+            if (g_interpreter->Invoke() != kTfLiteOk)
+            {
+                ESP_LOGE(TAG, "Invoke failed");
+                return false;
+            }
         }
 
         const int8_t y_q_local = g_output->data.int8[0];
@@ -1494,16 +1392,20 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "TinyML disabled for fixed-normal baseline mode");
     }
 
+    gpio_config_t profiling_gpio_cfg = {};
+    profiling_gpio_cfg.pin_bit_mask = (1ULL << PROFILING_FEATURE_GPIO) | (1ULL << PROFILING_INVOKE_GPIO);
+    profiling_gpio_cfg.mode = GPIO_MODE_OUTPUT;
+    profiling_gpio_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    profiling_gpio_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    profiling_gpio_cfg.intr_type = GPIO_INTR_DISABLE;
+    ESP_ERROR_CHECK(gpio_config(&profiling_gpio_cfg));
+    ESP_ERROR_CHECK(gpio_set_level(PROFILING_FEATURE_GPIO, 0));
+    ESP_ERROR_CHECK(gpio_set_level(PROFILING_INVOKE_GPIO, 0));
+
     ESP_ERROR_CHECK(i2c_init());
-    if (ina219_init() == ESP_OK)
-    {
-        ESP_LOGI(TAG, "INA219 ready");
-    }
-    else
-    {
-        ESP_LOGW(TAG, "INA219 init failed, power fields will stay zero");
-    }
     ESP_ERROR_CHECK(max30102_init());
+
+    printf("timestamp_ms,state,profile,quality,diff,red,ir\n");
 
     scheduler_state_t initial_state = SCHED_STATE_HIGH;
     if (kRunMode == RUN_MODE_FIXED_NORMAL)
@@ -1520,10 +1422,8 @@ extern "C" void app_main(void)
         1);
 
     int64_t last_activity_us = esp_timer_get_time();
-    int64_t last_power_read_us = 0;
     int64_t last_sparse_log_us = 0;
     int consecutive_i2c_errors = 0;
-    power_window_accumulator_t power_window_acc = {};
 
     while (true)
     {
@@ -1563,11 +1463,9 @@ extern "C" void app_main(void)
             }
 
             int64_t now = esp_timer_get_time();
-            maybe_sample_power(now, last_power_read_us, power_window_acc);
 
             if (now - last_sparse_log_us >= kSparseLogPeriodUs)
             {
-                publish_power_average(power_window_acc);
                 print_sparse_csv_log(now / 1000LL);
                 last_sparse_log_us = now;
             }
@@ -1612,11 +1510,9 @@ extern "C" void app_main(void)
         }
 
         const int64_t now = esp_timer_get_time();
-        maybe_sample_power(now, last_power_read_us, power_window_acc);
 
         if (now - last_sparse_log_us >= kSparseLogPeriodUs)
         {
-            publish_power_average(power_window_acc);
             print_sparse_csv_log(now / 1000LL);
             last_sparse_log_us = now;
         }

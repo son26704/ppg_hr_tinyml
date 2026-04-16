@@ -1035,13 +1035,19 @@ namespace
         }
 
         memcpy(g_scratch_x, g_win_model, sizeof(float) * static_cast<size_t>(kWindowSamplesModel));
+        
+        detrend_linear(g_scratch_x, kWindowSamplesModel); 
+        
         simple_bandpass(g_scratch_x, kWindowSamplesModel, kModelFs);
+        
         robust_zscore(g_scratch_x, kWindowSamplesModel);
 
         const float mean = mean_of(g_scratch_x, kWindowSamplesModel);
         const float std = std_of(g_scratch_x, kWindowSamplesModel, mean);
+        
         const int min_distance = (static_cast<int>(kModelFs * 60.0f / 140.0f) > 1) ? static_cast<int>(kModelFs * 60.0f / 140.0f) : 1;
         const float prominence = ((0.25f * std) > 0.12f) ? (0.25f * std) : 0.12f;
+        
         const int n_peaks = find_peaks_simple(
             g_scratch_x,
             kWindowSamplesModel,
@@ -1050,11 +1056,14 @@ namespace
             g_scratch_peaks,
             g_scratch_proms,
             128);
+            
         metrics->peak_bpm = (static_cast<float>(n_peaks) / (static_cast<float>(kWindowSamplesModel) / kModelFs)) * 60.0f;
 
         metrics->ac_best = 0.0f;
         metrics->ac_best_hr = 0.0f;
+        
         normalized_autocorr(g_scratch_x, kWindowSamplesModel, kModelFs, 40.0f, 180.0f, &metrics->ac_best, &metrics->ac_best_hr);
+        
         return true;
     }
 

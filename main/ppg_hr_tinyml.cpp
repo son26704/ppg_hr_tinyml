@@ -9,6 +9,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "dsps_fft2r.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -30,7 +31,7 @@ namespace
     };
 
 #ifndef RUN_MODE
-#define RUN_MODE RUN_MODE_FIXED_HIGH
+#define RUN_MODE RUN_MODE_ADAPTIVE
 #endif
 
     constexpr run_mode_t kRunMode = static_cast<run_mode_t>(RUN_MODE);
@@ -45,6 +46,7 @@ namespace
     constexpr int kWindowSec = 8;
     constexpr int kStrideSec = 2;
     constexpr int kWindowSamplesModel = static_cast<int>(kModelFs) * kWindowSec;
+    constexpr int kPsdFftSize = 256;
 
     constexpr int kSensorFs = 100;
     constexpr int kWindowSamplesSensor = kSensorFs * kWindowSec;
@@ -215,8 +217,10 @@ namespace
     static int g_scratch_peaks[128] = {0};
     static float g_scratch_proms[128] = {0};
     static float g_scratch_hr_inst[127] = {0};
-    static float g_scratch_pxx[129] = {0};
+    static float g_scratch_pxx[(kPsdFftSize / 2) + 1] = {0};
     static float g_scratch_hp[kWindowSamplesSensor] = {0};
+    static float g_fft_buf[2 * kPsdFftSize] = {0};
+    static bool g_fft_ready = false;
 
     static const float kScalerMean[kFeatureCount] = {
         -0.0737763546f,
@@ -358,23 +362,25 @@ namespace
 
     void robust_zscore(float *x, int n)
     {
-        memcpy(g_scratch_tmp, x, sizeof(float) * static_cast<size_t>(n));
-        const float med = median_of(g_scratch_tmp, n);
-        for (int i = 0; i < n; ++i)
-            g_scratch_tmp[i] = fabsf(x[i] - med);
-        float mad = median_of(g_scratch_tmp, n);
-        float scale = 1.4826f * mad;
-        if (scale < 1e-8f)
-            scale = std_of(x, n, mean_of(x, n));
-        if (scale < 1e-8f)
+        const float mean = mean_of(x, n);
+        float scale = std_of(x, n, mean);
+        if (scale < 1e-6f)
             scale = 1.0f;
+        const float inv_scale = 1.0f / scale;
         for (int i = 0; i < n; ++i)
-            x[i] = (x[i] - med) / scale;
+            x[i] = (x[i] - mean) * inv_scale;
     }
 
-    void normalized_autocorr(const float *x, int n, float *ac)
+    void normalized_autocorr(const float *x, int n, float fs, float bpm_min, float bpm_max, float *ac_best, float *ac_best_hr)
     {
-        float mean = mean_of(x, n);
+        if (ac_best != nullptr)
+            *ac_best = 0.0f;
+        if (ac_best_hr != nullptr)
+            *ac_best_hr = 0.0f;
+        if (x == nullptr || n <= 2 || ac_best == nullptr || ac_best_hr == nullptr)
+            return;
+
+        const float mean = mean_of(x, n);
         float denom = 0.0f;
         for (int i = 0; i < n; ++i)
         {
@@ -382,20 +388,38 @@ namespace
             denom += d * d;
         }
         if (denom < 1e-8f)
-        {
-            for (int i = 0; i < n; ++i)
-                ac[i] = 0.0f;
             return;
-        }
-        for (int lag = 0; lag < n; ++lag)
+
+        int lag_min = static_cast<int>(fs * 60.0f / bpm_max);
+        int lag_max = static_cast<int>(fs * 60.0f / bpm_min);
+        if (lag_min < 1)
+            lag_min = 1;
+        if (lag_max > n - 1)
+            lag_max = n - 1;
+        if (lag_max <= lag_min)
+            return;
+
+        int best_lag = lag_min;
+        float best_val = -1.0f;
+        for (int lag = lag_min; lag <= lag_max; ++lag)
         {
             float num = 0.0f;
             for (int i = 0; i < n - lag; ++i)
             {
                 num += (x[i] - mean) * (x[i + lag] - mean);
             }
-            ac[lag] = num / denom;
+            const float ac = num / denom;
+            if (ac > best_val)
+            {
+                best_val = ac;
+                best_lag = lag;
+            }
         }
+
+        if (best_val < 0.0f)
+            best_val = 0.0f;
+        *ac_best = best_val;
+        *ac_best_hr = 60.0f / (static_cast<float>(best_lag) / fs);
     }
 
     int find_peaks_simple(const float *x, int n, int min_distance, float prominence_th,
@@ -451,36 +475,54 @@ namespace
         }
     }
 
+    bool ensure_fft_ready()
+    {
+        if (g_fft_ready)
+            return true;
+        const esp_err_t err = dsps_fft2r_init_fc32(nullptr, kPsdFftSize);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "dsps_fft2r_init_fc32 failed: %s", esp_err_to_name(err));
+            return false;
+        }
+        g_fft_ready = true;
+        return true;
+    }
+
     void compute_psd_features(const float *x, int n, float fs, float &psd_hr_ratio,
                               float &spectral_entropy, float &dom_bpm_hr_band)
     {
-        const int nfft = (n >= 256) ? 256 : n;
-        if (nfft < 32)
-        {
-            psd_hr_ratio = 0.0f;
-            spectral_entropy = 0.0f;
-            dom_bpm_hr_band = 0.0f;
-            return;
-        }
+        psd_hr_ratio = 0.0f;
+        spectral_entropy = 0.0f;
+        dom_bpm_hr_band = 0.0f;
 
+        if (x == nullptr || n < kPsdFftSize || !ensure_fft_ready())
+            return;
+
+        const int nfft = kPsdFftSize;
         const int bins = nfft / 2 + 1;
         const float df = fs / static_cast<float>(nfft);
-        float pxx_sum = 0.0f;
 
+        for (int i = 0; i < nfft; ++i)
+        {
+            g_fft_buf[2 * i + 0] = x[i];
+            g_fft_buf[2 * i + 1] = 0.0f;
+        }
+
+        dsps_fft2r_fc32(g_fft_buf, nfft);
+        dsps_bit_rev_fc32(g_fft_buf, nfft);
+
+        float pxx_sum = 0.0f;
         for (int k = 0; k < bins; ++k)
         {
-            float re = 0.0f;
-            float im = 0.0f;
-            for (int t = 0; t < nfft; ++t)
-            {
-                const float ang = 2.0f * 3.14159265f * static_cast<float>(k * t) / static_cast<float>(nfft);
-                re += x[t] * cosf(ang);
-                im -= x[t] * sinf(ang);
-            }
+            const float re = g_fft_buf[2 * k + 0];
+            const float im = g_fft_buf[2 * k + 1];
             const float p = re * re + im * im;
             g_scratch_pxx[k] = (p > 1e-12f) ? p : 1e-12f;
             pxx_sum += g_scratch_pxx[k];
         }
+        if (pxx_sum < 1e-12f)
+            return;
 
         float total_power = 0.0f;
         float hr_power = 0.0f;
@@ -516,7 +558,6 @@ namespace
     {
         memcpy(g_scratch_x, sig_raw, sizeof(float) * static_cast<size_t>(n));
 
-        detrend_linear(g_scratch_x, n);
         simple_bandpass(g_scratch_x, n, fs);
         robust_zscore(g_scratch_x, n);
 
@@ -566,29 +607,9 @@ namespace
         if (n_peaks > 0)
             peak_prom_mean /= static_cast<float>(n_peaks);
 
-        normalized_autocorr(g_scratch_x, n, g_scratch_ac);
-        const int lag_min = static_cast<int>(fs * 60.0f / 180.0f);
-        int lag_max = static_cast<int>(fs * 60.0f / 40.0f);
-        if (lag_max > n - 1)
-            lag_max = n - 1;
-
         float ac_best = 0.0f;
         float ac_best_hr = 0.0f;
-        if (lag_max > lag_min)
-        {
-            int best_lag = lag_min;
-            float best_val = g_scratch_ac[lag_min];
-            for (int lag = lag_min + 1; lag <= lag_max; ++lag)
-            {
-                if (g_scratch_ac[lag] > best_val)
-                {
-                    best_val = g_scratch_ac[lag];
-                    best_lag = lag;
-                }
-            }
-            ac_best = best_val;
-            ac_best_hr = 60.0f / (static_cast<float>(best_lag) / fs);
-        }
+        normalized_autocorr(g_scratch_x, n, fs, 40.0f, 180.0f, &ac_best, &ac_best_hr);
 
         float psd_hr_ratio = 0.0f;
         float spectral_entropy = 0.0f;
@@ -1014,7 +1035,6 @@ namespace
         }
 
         memcpy(g_scratch_x, g_win_model, sizeof(float) * static_cast<size_t>(kWindowSamplesModel));
-        detrend_linear(g_scratch_x, kWindowSamplesModel);
         simple_bandpass(g_scratch_x, kWindowSamplesModel, kModelFs);
         robust_zscore(g_scratch_x, kWindowSamplesModel);
 
@@ -1032,29 +1052,9 @@ namespace
             128);
         metrics->peak_bpm = (static_cast<float>(n_peaks) / (static_cast<float>(kWindowSamplesModel) / kModelFs)) * 60.0f;
 
-        normalized_autocorr(g_scratch_x, kWindowSamplesModel, g_scratch_ac);
-        const int lag_min = static_cast<int>(kModelFs * 60.0f / 180.0f);
-        int lag_max = static_cast<int>(kModelFs * 60.0f / 40.0f);
-        if (lag_max > kWindowSamplesModel - 1)
-            lag_max = kWindowSamplesModel - 1;
-
         metrics->ac_best = 0.0f;
         metrics->ac_best_hr = 0.0f;
-        if (lag_max > lag_min)
-        {
-            int best_lag = lag_min;
-            float best_val = g_scratch_ac[lag_min];
-            for (int lag = lag_min + 1; lag <= lag_max; ++lag)
-            {
-                if (g_scratch_ac[lag] > best_val)
-                {
-                    best_val = g_scratch_ac[lag];
-                    best_lag = lag;
-                }
-            }
-            metrics->ac_best = best_val;
-            metrics->ac_best_hr = 60.0f / (static_cast<float>(best_lag) / kModelFs);
-        }
+        normalized_autocorr(g_scratch_x, kWindowSamplesModel, kModelFs, 40.0f, 180.0f, &metrics->ac_best, &metrics->ac_best_hr);
         return true;
     }
 
@@ -1080,11 +1080,14 @@ namespace
 
         {
             profiling_pulse_t invoke_pulse(PROFILING_INVOKE_GPIO);
+            const int64_t t_start = esp_timer_get_time();
             if (g_interpreter->Invoke() != kTfLiteOk)
             {
                 ESP_LOGE(TAG, "Invoke failed");
                 return false;
             }
+            const int64_t t_end = esp_timer_get_time();
+            ESP_LOGI(TAG, "TinyML Invoke time: %lld us", static_cast<long long>(t_end - t_start));
         }
 
         const int8_t y_q_local = g_output->data.int8[0];
